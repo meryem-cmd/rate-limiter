@@ -153,3 +153,6 @@ This project prioritizes demonstrating rate-limiting concepts (atomicity, concur
 ## What this project demonstrates
 
 Concurrency control and atomic operations (Redis Lua scripting), algorithm design (token bucket vs. sliding window), API contract design (standard rate-limit headers), systems debugging (diagnosing a chain of real infrastructure bottlenecks under load), and load testing methodology (k6, before/after evidence-based comparisons).
+<img width="721" height="326" alt="image" src="https://github.com/user-attachments/assets/da97f02c-70ac-4bb9-ace8-d838e930b505" />
+<img width="740" height="338" alt="image" src="https://github.com/user-attachments/assets/a27e4992-968c-4277-912b-57d27b4d6063" />
+
