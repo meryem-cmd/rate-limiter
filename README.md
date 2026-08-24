@@ -1,3 +1,6 @@
+![Python](https://img.shields.io/badge/python-3.11+-blue)
+![Django](https://img.shields.io/badge/django-REST-green)
+![License](https://img.shields.io/badge/license-MIT-lightgrey)
 # Token Bucket Rate Limiter Service
 
 A standalone API rate-limiting service built with Django and Redis. Other services call it to decide, per request, whether a client should be **ALLOWED** or **DENIED** — the same category of problem solved by API gateways at companies like Stripe, GitHub, and Cloudflare.
