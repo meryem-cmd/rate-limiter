@@ -1,9 +1,13 @@
-![Python](https://img.shields.io/badge/python-3.11+-blue)
-![Django](https://img.shields.io/badge/django-REST-green)
-![License](https://img.shields.io/badge/license-MIT-lightgrey)
 # Token Bucket Rate Limiter Service
 
-A standalone API rate-limiting service built with Django and Redis. Other services call it to decide, per request, whether a client should be **ALLOWED** or **DENIED** — the same category of problem solved by API gateways at companies like Stripe, GitHub, and Cloudflare.
+![Python](https://img.shields.io/badge/python-3.11+-blue)
+![Django](https://img.shields.io/badge/django-REST%20Framework-green)
+![Redis](https://img.shields.io/badge/redis-atomic%20Lua%20scripts-red)
+![License](https://img.shields.io/badge/license-MIT-lightgrey)
+
+> Built two versions of the core check on purpose — a naive one and an atomic one — to prove a race condition mattered under load, not just claim it did. See [Results](#results) for the before/after.
+
+A standalone API rate-limiting service built with Django and Redis. Other services call it to decide, per request, whether a client should be ALLOWED or DENIED — the same category of problem solved by API gateways at companies like Stripe, GitHub, and Cloudflare.
 
 ## Features
 
@@ -158,4 +162,31 @@ This project prioritizes demonstrating rate-limiting concepts (atomicity, concur
 Concurrency control and atomic operations (Redis Lua scripting), algorithm design (token bucket vs. sliding window), API contract design (standard rate-limit headers), systems debugging (diagnosing a chain of real infrastructure bottlenecks under load), and load testing methodology (k6, before/after evidence-based comparisons).
 <img width="721" height="326" alt="image" src="https://github.com/user-attachments/assets/da97f02c-70ac-4bb9-ace8-d838e930b505" />
 <img width="740" height="338" alt="image" src="https://github.com/user-attachments/assets/a27e4992-968c-4277-912b-57d27b4d6063" />
+
+
+
+
+
+
+MIT License
+
+Copyright (c) 2026 Maryyam Tanveer
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
 
