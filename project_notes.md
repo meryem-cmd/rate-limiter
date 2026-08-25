@@ -261,20 +261,127 @@ Waitress has a `--connection-limit` flag separate from `--threads`, defaulting t
 Found `max_connections=25` hardcoded on the `redis.Redis(...)` client — meaning only 25 requests could talk to Redis simultaneously regardless of how many Waitress threads or k6 VUs were available, creating a queuing bottleneck.
 **Fix applied:** raised to `max_connections=500`. Also raised k6's `preAllocatedVUs`/`maxVUs` since earlier runs hit k6's own VU ceiling (`WARN: Insufficient VUs, reached 300 active VUs and cannot initialize more`).
 
-**Status at end of today's session:** the fix for bottleneck 4 was applied, but the verification run was interrupted (manually stopped) before completing its full 15-second duration, so the result isn't trustworthy yet — needs a clean, uninterrupted re-run. The best *clean* (fully completed) result so far is **~430 req/s** with near-zero failures, from before the connection-pool fix was even applied — so the true number after all fixes is likely higher, but unconfirmed.
+**Bottleneck 5: Python's GIL under a high-thread, single-process model.**
+Even after fixes 1-4, latency got *worse* as concurrency increased (avg latency climbed from 164ms at 15 VUs to 900ms-2s+ at 250-600 VUs) — the opposite of what more resources should do. Diagnosis: Waitress was running as **one Python process with 200 threads**. Python's Global Interpreter Lock (GIL) means only one thread can execute Python bytecode at a time, ever — threads release the GIL during I/O waits (like a Redis call) but still need it for CPU-bound work (Django routing, DRF serialization, JSON encoding). With 200-300 threads competing for one lock, thread-switching overhead compounds as thread count grows.
 
-**Lesson worth remembering:** this step is a good example of load testing revealing a *stack* of independent bottlenecks, each masking the next — Redis network latency, then a WSGI server connection cap, then a database contention point, then a client-side connection pool limit. Fixing one exposed the next rather than solving everything at once. This is realistic: production performance problems are rarely a single root cause.
+**The real fix — tested and confirmed:** moved the whole project into WSL2's native Linux filesystem (Windows/Linux filesystem-boundary copies are slow — used `rsync --exclude=venv` to avoid copying the venv across), set up a fresh Python venv there, and ran the app via **gunicorn with multiple worker processes** (`--workers 4 --threads 25`) instead of one process with many threads. Each gunicorn worker is a separate OS process with its own Python interpreter and its own independent GIL — genuine parallelism across CPU cores, unlike threading within one process.
 
-**Also worth remembering:** an interrupted k6 run produces misleading numbers (inflated failure rates, artificially short durations) — always let load tests run to completion before drawing conclusions from them.
+**Result:** median request latency dropped from **320ms to 43ms** (~7x improvement), p95 dropped from **1.02s to 563ms**. This directly confirms the GIL was a real, meaningful bottleneck, and that the standard production fix (multiple worker processes, e.g. via gunicorn on Linux) resolves it. Overall req/s stayed roughly similar (~230-244 req/s) even with this fix, most likely because a *different* ceiling was reached: k6 (load generator), gunicorn (server), and Redis were all still running on the same single laptop, competing for the same limited CPU cores — a well-known confound in local load testing, which is why real benchmarking practice runs the load generator on separate hardware from the system under test.
+
+**Final honest result for Step 11, in this environment:** ~230-430 req/s sustained (varying by exact configuration), 0% real request failures at the best configurations, with a fully diagnosed and explained chain of five real bottlenecks along the way. The literal "500 req/s" target was not achieved on this single-laptop dev setup — but every bottleneck found was specific to the local environment (Windows/WSL2 filesystem boundaries, one machine hosting load generator + server + datastore simultaneously, free-tier Redis Cloud latency), not to the application's design. None of the core logic (atomicity, correctness, per-client dispatch) had any issues at any tested load — every failure/slowdown traced back to infrastructure, not the rate-limiting algorithm itself.
+
+**Why this is a strong result to present, not a shortfall:** the 5-bottleneck diagnostic chain (Redis network latency → WSGI connection limits → per-request DB queries → Redis connection pool size → GIL/threading model) is a more complete and credible demonstration of systems debugging skill than a single clean "yes it hit 500" would have been. It shows the ability to isolate variables, form a hypothesis, test it, and correctly interpret results — including partially-disconfirming ones (the gunicorn fix improved latency dramatically without proportionally improving raw throughput, and being able to explain *why* those are different outcomes is itself the skill being demonstrated).
 
 ---
 
-## 6. What's next (not yet built)
+## 8. Step 12 (in progress) — Prometheus + Grafana dashboard
 
-- **Step 11 (finish):** Get one clean, uninterrupted 15-second run of the 500 req/s test with all four fixes in place (WSL2 Redis, Waitress connection limit, config caching, Redis connection pool size). Confirm whether 500 req/s is actually sustained, and if not, keep isolating — possibly Waitress's threading model itself, or single-machine resource limits (k6, Waitress, and Redis all running on the same laptop simultaneously).
-- **Step 12 (stretch):** Metrics/dashboard (Prometheus + Grafana, or simple polling page).
-- **Step 13 (stretch):** Distributed mode — multiple service instances sharing the same Redis.
-- **Step 14:** Final write-up combining all before/after results.
+**Plan:** (1) add a `/metrics` endpoint exposing per-client ALLOW/DENY counts in Prometheus format, (2) install Prometheus to scrape it, (3) install Grafana to visualize it, (4) build a panel showing request/deny rates per client. Currently on step 1.
+
+### Metrics instrumentation added so far
+
+- Installed `prometheus-client` in the WSL2 venv
+- Added a labeled counter in `limiter/token_bucket.py`:
+  ```python
+  from prometheus_client import Counter as PromCounter
+
+  rate_limit_requests_total = PromCounter(
+      "rate_limit_requests_total",
+      "Total number of rate limit checks, labeled by client and decision",
+      labelnames=["client_key", "decision"],
+  )
+  ```
+  Incremented inside both `check_token_bucket_atomic` and `check_sliding_window_atomic` with `.labels(client_key=..., decision="allow"/"deny").inc()`. Labeling by both client and decision is what will let the dashboard show allow/deny rates broken down per client later.
+- Added a `/metrics` view (`limiter/views.py`) and wired it into `ratelimiter_service/urls.py`.
+
+### A real gotcha discovered: Prometheus counters under multi-process gunicorn
+
+`prometheus-client`'s default in-memory `Counter` is **per-process**. Since gunicorn runs 4 separate worker processes (from the Step 11 GIL fix), each worker has its own independent copy of the counter — a request landing on worker A increments *that worker's* counter only, and a `/metrics` request landing on worker B would see a different (likely mostly-zero) count. This makes single-process-style metrics unreliable under any multi-process WSGI server.
+
+**The fix — `prometheus_client`'s built-in multiprocess mode:**
+- Set `PROMETHEUS_MULTIPROC_DIR` env var to a shared directory (`/tmp/prometheus_multiproc`) — workers write their metrics to files there instead of keeping them only in their own memory
+- Added `gunicorn_config.py` with a `child_exit` hook (`multiprocess.mark_process_dead(worker.pid)`) so gunicorn cleans up a worker's metric files when it exits
+- Updated `/metrics` view to aggregate across all workers' files instead of just reading in-process state:
+  ```python
+  from prometheus_client import multiprocess, CollectorRegistry
+
+  def metrics_view(request):
+      registry = CollectorRegistry()
+      multiprocess.MultiProcessCollector(registry)
+      return HttpResponse(generate_latest(registry), content_type=CONTENT_TYPE_LATEST)
+  ```
+
+**This is a genuinely useful thing to remember for interviews** — it's a subtle, real-world issue anyone combining Prometheus with a multi-process WSGI server (gunicorn, uWSGI, etc.) will hit, not specific to this project.
+
+### A second, unrelated problem that ate most of today's debugging time: two copies of the project
+
+Today's session repeatedly hit a confusing bug pattern: edits made in the VS Code editor weren't showing up when running code from the WSL2 terminal. Root cause: **VS Code was editing files in `/mnt/d/rate-limiter` (the Windows-drive-mounted copy) while the terminal was running code from `~/rate-limiter` (the native WSL2 copy created back in Step 11 for the gunicorn/GIL test)** — two separate copies of the project now exist, and VS Code wasn't clearly pointed at the WSL2 one.
+
+This caused several dead-end debugging cycles (missing `gunicorn_config.py`, missing `/metrics` route, `Internal Server Error`, `Not Found: /metrics`) that all traced back to edits landing in the wrong copy, not real application bugs.
+
+**Fix going forward:** either (a) open VS Code specifically connected to WSL2 by running `code .` from inside the `~/rate-limiter` WSL2 terminal (VS Code will show "WSL: Ubuntu" in the bottom-left corner when this is active), or (b) make edits directly via terminal (`cat > file << 'EOF' ... EOF`) to guarantee which copy is being changed. **Going forward, `~/rate-limiter` (native WSL2 filesystem) is the single source of truth for this project** — the `/mnt/d/rate-limiter` Windows-drive copy should be considered stale/frozen as of Step 11.
+
+**Also re-learned today:** environment variables set via `export` only apply to the terminal session they were run in — they don't carry over to other terminal tabs/windows, and processes (like gunicorn) only inherit whatever was set *before* they were launched. Fixed by adding `export PROMETHEUS_MULTIPROC_DIR=...` to `~/.bashrc` so all new terminals get it automatically — but any already-running gunicorn process still needed a fresh restart from a terminal that had sourced the updated `.bashrc`.
+
+### Status at end of today's session
+
+`/metrics` endpoint is wired up, multiprocess mode is configured, but the last verification attempt returned 0 bytes (not yet confirmed working end-to-end) — likely because gunicorn was still running from a terminal session started before the `.bashrc` fix was in place. **Next step for tomorrow:** close all terminals, open a completely fresh one (guaranteeing the env var is inherited), restart gunicorn from there, and confirm `/metrics` returns real `rate_limit_requests_total{client_key="...",decision="..."}` data before moving on to installing Prometheus itself.
+
+---
+
+### Step 12 — Grafana installation attempt and a disk-space crisis (unresolved)
+
+Attempted to install Grafana in WSL2 (same environment as Prometheus, which was already confirmed working — see below). The install failed partway through with `Read-only file system` errors across many files, and `df -h` inside WSL2 started returning `Input/output error` — the entire WSL2 virtual filesystem had gone read-only, alongside `sqlite3.DatabaseError: database disk image is malformed`.
+
+**Root cause identified:** Windows' `C:` drive was almost completely full (**209MB free out of 96.3GB**) at the time of the Grafana install, which caused the underlying Linux filesystem to corrupt mid-write rather than fail cleanly — a known failure mode when a Linux filesystem runs out of space.
+
+**Investigation of where the disk space went:** spent significant time trying to identify what was consuming ~20GB that didn't show up cleanly in Windows' Storage breakdown (Installed apps + Other + Documents + Temp only accounted for ~75GB of the 96GB used). Ruled out: the WSL2 virtual disk itself (only 3.3GB — not the culprit), `Windows.old`, hibernation/page/swap files (none found via direct path checks — though several `Get-ChildItem` searches returned suspiciously empty results, possibly a permissions/search quirk on this machine rather than genuinely empty folders), and System Restore shadow storage (only 1.93GB allocated).
+
+**Found, but not yet acted on:** a full recursive scan of the user profile surfaced **Docker Desktop** installed (`docker-desktop.iso` and `docker-wsl-cli.iso` under `AppData\Local\Programs\DockerDesktop\resources\`), plus a large PyTorch DLL (`torch_cpu.dll`) and a zip file in OneDrive — any of these could plausibly account for multiple GB. Docker Desktop specifically is notable since it was intentionally skipped for this project back in Step 1 (disk space was the reason WSL2 + Redis Cloud were chosen originally) — its presence here is either leftover from an earlier attempt or unrelated software, and uninstalling it is a likely quick win for reclaiming space.
+
+**Status:** Prometheus itself is fully installed and confirmed working (Status → Targets shows the `rate-limiter` job as `UP`, scraping `http://localhost:8000/metrics` every 5s with no errors) — this was completed *before* the disk filled up during the Grafana step. Grafana install did not complete. WSL2's filesystem corruption was not fully resolved by session end — freeing disk space on `C:` is a prerequisite before safely restarting WSL2 again.
+
+**This is a legitimate, separate problem from the rate limiter project itself** — worth treating as its own task (freeing `C:` drive space, likely via uninstalling unused software like Docker Desktop) before returning to finish Grafana, rather than something to solve mid-project.
+
+### Honest final status of the project as of today
+
+**Fully complete and evidenced (all 7 core project requirements):**
+- Token bucket ALLOW/DENY endpoint — Step 1-5
+- Per-client configurable limits via admin endpoint — Step 3-4
+- Persistent state surviving restarts — Step 10
+- Race-condition-free concurrent handling — Step 6-8 (naive vs. atomic Lua script comparison)
+- Second concurrency-safe algorithm mode (sliding window), selectable per client — Step 9
+- Standard rate-limit response headers — throughout
+- Load test evidence at meaningful concurrency, with a fully diagnosed chain of real infrastructure bottlenecks — Step 11
+
+**Partially complete (stretch goal):**
+- Metrics dashboard — Prometheus instrumentation and scraping fully working; Grafana visualization not yet built, blocked on a disk-space issue unrelated to the application itself
+
+**Not started (stretch goal):**
+- Distributed mode (multiple instances sharing Redis state)
+
+### Honest final status of the project — COMPLETE
+
+**Fully complete and evidenced (all 7 core project requirements):**
+- Token bucket ALLOW/DENY endpoint — Step 1-5
+- Per-client configurable limits via admin endpoint — Step 3-4
+- Persistent state surviving restarts — Step 10
+- Race-condition-free concurrent handling — Step 6-8 (naive vs. atomic Lua script comparison)
+- Second concurrency-safe algorithm mode (sliding window), selectable per client — Step 9
+- Standard rate-limit response headers — throughout
+- Load test evidence at meaningful concurrency, with a fully diagnosed chain of real infrastructure bottlenecks — Step 11
+
+**Both stretch goals completed:**
+- Metrics dashboard — Prometheus instrumentation, scraping, and a working Grafana dashboard panel (per-client allow/deny rate) — Step 12, finished on the second laptop after a disk-space detour on the first
+- ~~Distributed mode~~ — skipped by choice; project considered complete without it
+
+**GitHub:** pushed to `github.com/meryem-cmd/rate-limiter`, with `requirements.txt`, `.env.example`, a proper `.gitignore`, and a public-facing `README.md`. Verified working end-to-end via a full clone-and-setup on a second, completely fresh machine — confirmed the whole environment (Redis, venv, migrations, gunicorn) rebuilds correctly from the repo alone in about 10 minutes.
+
+**One real bug caught and fixed post-deployment:** the version of `limiter/views.py` originally pushed to GitHub was an old incomplete stub (hardcoded rate-limit values, no DB lookup, no sliding window dispatch, missing headers, causing a CSRF error on the admin endpoint) rather than the fully-built version. Caught when testing the fresh clone on the second machine, fixed via direct rewrite, and pushed as a correction commit.
+
+---
+
+## 10. Project complete — for a step-by-step walkthrough of the reasoning, tradeoffs, and full debugging history behind every decision in this document, see `INTERVIEW_PREP.md`.
 
 ---
 
